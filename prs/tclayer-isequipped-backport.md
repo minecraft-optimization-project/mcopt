@@ -1,32 +1,21 @@
-# Accessories (tclayer, 1.20.1): Make Trinkets isEquipped and inventory views cheap
-
-**Target:** `wisp-forest/accessories` branch `1.20.1-Backport`
-**Branch:** `minecraft-optimization-project/accessories:perf/1.20.1-tclayer-isequipped` (3 commits on `59869f4f`, beta.48)
-**Status:** draft, not opened
-
----
-
-Hi! Profiling a 365-mod 1.20.1 server (Prominence II) showed the Trinkets compat layer at **~4–5% of total server tick time**. The cost comes from Trinkets API calls that Artifacts makes for every living entity every tick:
-
-- `LivingEntityTrinketComponent#isEquipped`, via Artifacts `isEquippedBy`
-- `getInventory().values()`, via the Artifacts `LivingEntity` tick mixin
+Reduces the server tick cost of the Trinkets compat layer on 1.20.1. On a 365 mod pack (Prominence II) tclayer was 4 to 5% of total server tick time, almost all from `LivingEntityTrinketComponent#isEquipped` and `getInventory()` being called per entity per tick (Artifacts `isEquippedBy` and its `LivingEntity` tick mixin).
 
 ### Changes
 
-1. **`isEquipped` delegates to the Accessories capability** (`WrappedTrinketComponent#isEquipped`), as the 1.21 branches already do (`ec2d2d48`).
-   - The old body iterated `getInventory()`, which rebuilds the whole wrapped group/slot map and hashes it into new sets on every call.
-   - The override is **kept, not removed**. We first tried a straight cherry-pick of `ec2d2d48`, and it crashes with **Things** 0.3.3: Things `@ModifyVariable`s the predicate at HEAD of `LivingEntityTrinketComponent#isEquipped` and `@ModifyArg`s inside `getEquipped`. Keeping the method keeps those mixins working. `getEquipped`/`forEach` are unchanged; the Trinkets `forEach` contract also visits empty slots.
-2. **`ImmutableDelegatingMap#values()`/`entrySet()` return lazy read-only views** instead of collecting a fresh `toUnmodifiableSet()` snapshot per call. The contents are the same. The old sets' iteration order was unspecified (randomized per JVM run).
-3. **`WrappingTrinketsUtils#filterGroupInfo`** no longer compiles a regex per call. It's reached from `ItemStack#is(TagKey)` via `ItemStackMixin#redirectTags`. The equivalent `indexOf`/`lastIndexOf` scan was fuzz-tested against the regex on 2,000,000 generated slot names. `redirectTags` also iterates `getTags()` directly instead of collecting it into a list.
+1. `LivingEntityTrinketComponent#isEquipped` delegates to `WrappedTrinketComponent#isEquipped` (Accessories capability lookup), same as the 1.21 branches after ec2d2d48. The old body iterated `getInventory()`, which rebuilds the wrapped group/slot map on every call. The override is kept instead of removed: Things 0.3.3 has a `@ModifyVariable` at HEAD of this method, and a straight cherry-pick of ec2d2d48 makes that mixin fail and crashes the server. `getEquipped` and `forEach` are unchanged.
+2. `ImmutableDelegatingMap#values()` and `#entrySet()` return lazy read-only views instead of collecting a new `toUnmodifiableSet()` per call. Same contents. Iteration order of the old sets was already unspecified.
+3. `WrappingTrinketsUtils#filterGroupInfo` replaces `replaceAll("(trinket_group_).*-", "")` with an equivalent `indexOf`/`lastIndexOf` scan, so no regex is compiled per call (reached from `ItemStack#is(TagKey)` via `ItemStackMixin#redirectTags`). Checked against the regex on 2,000,000 generated inputs. `redirectTags` also iterates `getTags()` directly instead of via `toList()`.
 
-### Results
+### Benchmark
 
-Full Prominence II pack on a test server, identical seeded world, 1,500 mixed mobs, 150 s spark profile per side:
+Full Prominence II 4.1.3 server, same seeded world per run, 1,500 mixed mobs in forceloaded chunks, 150 s spark sample per run, 4 runs per side, alternating.
 
-| | beta.14 (released) | This PR |
+| | beta.14 | this PR |
 |---|---|---|
-| tclayer share of server tick time | 3.12% | **0.80%** |
-| `LivingEntityTrinketComponent#isEquipped` (inclusive) | 2.97% | **0.20%** |
-| tclayer + accessories + artifacts combined | 5.81% | **4.35%** |
+| tclayer, % of tick time | 3.12 to 4.51 (mean 3.77) | 0.62 to 0.80 (mean 0.67) |
+| `LivingEntityTrinketComponent#isEquipped`, inclusive | 2.97 to 3.52 | 0.20 to 0.26 |
+| tclayer + accessories + artifacts | mean 6.95 | mean 4.08 |
 
-Tested in game on the same pack: no mixin failures, and the server runs normally with Things, Artifacts and Botania's Trinkets integration loaded.
+Part of the cost moves into the Accessories capability lookup, which is expected. The change in average tick time over the whole server was within run to run noise for this scenario.
+
+Ran with the full pack (Things, Artifacts, Botania Trinkets integration loaded) with no mixin errors.
